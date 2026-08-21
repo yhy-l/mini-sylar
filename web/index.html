@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mini-sylar · C++23 协程服务器</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="container">
+  <header class="nav">
+    <div class="brand">mini<span>-sylar</span></div>
+    <nav>
+      <a href="/">首页</a>
+      <a href="/about.html">关于</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <h1>mini-sylar 高性能服务器</h1>
+    <p>基于 C++23 协程 + epoll 的事件驱动服务器：3 个工作线程，一连接一协程，IO 全异步。</p>
+    <div class="chips">
+      <span class="chip">C++23</span>
+      <span class="chip">std::coroutine</span>
+      <span class="chip">epoll / ET</span>
+      <span class="chip">多线程调度器</span>
+      <span class="chip">HTTP/1.1</span>
+    </div>
+  </section>
+
+  <h2 class="section">接口一览</h2>
+  <div class="cards">
+    <a class="card" href="/">
+      <span class="method get">GET</span>
+      <h3><code>/</code> 首页</h3>
+      <p>这个页面（静态文件）</p>
+    </a>
+    <a class="card" href="/about.html">
+      <span class="method get">GET</span>
+      <h3><code>/about.html</code> 关于</h3>
+      <p>项目架构与设计说明</p>
+    </a>
+    <a class="card" href="/api/hello">
+      <span class="method get">GET</span>
+      <h3><code>/api/hello</code> JSON</h3>
+      <p>返回一段欢迎 JSON</p>
+    </a>
+    <a class="card" href="/api/time">
+      <span class="method get">GET</span>
+      <h3><code>/api/time</code> 时间</h3>
+      <p>返回当前时间戳与时间</p>
+    </a>
+    <div class="card" id="card-echo">
+      <span class="method post">POST</span>
+      <h3><code>/api/echo</code> 回显</h3>
+      <p>把请求体原样回显为 JSON（点击跳到下方体验区）</p>
+    </div>
+    <a class="card" href="/text">
+      <span class="method get">GET</span>
+      <h3><code>/text</code> 纯文本</h3>
+      <p>返回一段纯文本响应</p>
+    </a>
+  </div>
+
+  <h2 class="section">在线体验</h2>
+  <div class="demo">
+    <strong>获取服务器时间</strong>
+    <div class="row">
+      <button id="btn-time">GET /api/time</button>
+    </div>
+    <pre id="out-time">点击按钮查看结果…</pre>
+  </div>
+
+  <div class="demo" style="margin-top:20px;">
+    <strong>POST 回显测试</strong>
+    <div class="row">
+      <input type="text" id="echo-input" placeholder="输入要回显的内容…">
+      <button id="btn-echo">POST /api/echo</button>
+    </div>
+    <pre id="out-echo">点击按钮查看结果…</pre>
+  </div>
+
+  <footer>mini-sylar · 秋招复习项目 · C++23 coroutine + epoll</footer>
+</div>
+<script src="/js/app.js"></script>
+</body>
+</html>

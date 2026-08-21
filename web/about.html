@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>关于 · mini-sylar</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="container">
+  <header class="nav">
+    <div class="brand">mini<span>-sylar</span></div>
+    <nav>
+      <a href="/">首页</a>
+      <a href="/about.html">关于</a>
+    </nav>
+  </header>
+
+  <section class="hero" style="text-align:left;">
+    <h1>关于项目</h1>
+    <p>一个仿 sylar 的 C++ 高性能服务器，核心设计：协程调度 + epoll 事件循环。</p>
+  </section>
+
+  <h2 class="section">架构</h2>
+  <ul class="arch">
+    <li><strong>日志系统</strong>：Logger / Formatter / Appender / 单例管理器，可定制格式与输出地</li>
+    <li><strong>地址与 Socket</strong>：IPv4/IPv6/Unix 封装，非阻塞 + TCP_NODELAY</li>
+    <li><strong>协程 Task</strong>：C++23 std::coroutine，promise_type 状态机（READY / WAITING_IO / FINISHED）</li>
+    <li><strong>调度器 Scheduler</strong>：3 个工作线程 + 任务队列 + 条件变量</li>
+    <li><strong>IOManager</strong>：epoll 边缘触发 + tickle 管道 + 协程句柄登记</li>
+    <li><strong>TcpServer / HttpServer</strong>：一连接一协程，HTTP 解析 + 路由表 + 静态文件</li>
+  </ul>
+
+  <h2 class="section">设计要点</h2>
+  <ul class="arch">
+    <li>协程不占线程：co_await 挂起后线程立刻处理其他任务</li>
+    <li>连接数不受线程数限制：1000 连接 = 1000 个挂起的 handleClient 协程</li>
+    <li>关闭是协作式：信号 → 标志 → iom.stop() → 队列接力收尾 → join</li>
+    <li>帧句柄生命周期：move-only Task、只在 done() 时 destroy、责任单点转移</li>
+  </ul>
+
+  <p style="margin-top:32px;"><a class="link" href="/">← 返回首页</a></p>
+  <footer>mini-sylar · C++23 coroutine + epoll</footer>
+</div>
+</body>
+</html>
