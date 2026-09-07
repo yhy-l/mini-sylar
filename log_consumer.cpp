@@ -10,6 +10,9 @@
 #include <filesystem>
 #include <cstdio>
 #include <csignal>
+#include <cstdlib>
+#include <thread>
+#include <chrono>
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
@@ -113,8 +116,22 @@ int main()
 
     amqp_connection_state_t conn = amqp_new_connection();
     amqp_socket_t* socket = amqp_tcp_socket_new(conn);
-    if (!socket || amqp_socket_open(socket, "127.0.0.1", 5672) != AMQP_STATUS_OK) {
-        fprintf(stderr, "[log_consumer] 无法连接RabbitMQ 127.0.0.1:5672\n");
+    const char* mq_host = std::getenv("MQ_HOST");
+    if (!mq_host) mq_host = "127.0.0.1";
+
+    // RabbitMQ 可能还没就绪（容器启动时序），无限等待直到连上
+    bool connected = false;
+    for (int attempt = 1; !connected; ++attempt) {
+        if (socket && amqp_socket_open(socket, mq_host, 5672) == AMQP_STATUS_OK) {
+            connected = true;
+            break;
+        }
+        fprintf(stderr, "[log_consumer] 无法连接RabbitMQ %s:5672（第%d次，2秒后重试）\n",
+                mq_host, attempt);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    if (!connected) {
+        fprintf(stderr, "[log_consumer] RabbitMQ 连接失败，退出\n");
         return 1;
     }
     amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");

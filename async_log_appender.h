@@ -2,7 +2,7 @@
 #include "log.h"
 #include "mq_log_sender.h"
 #include <nlohmann/json.hpp>
-#include <deque>
+#include <array>
 #include <vector>
 #include <memory>
 #include <thread>
@@ -15,10 +15,10 @@
 namespace sylar {
 
 /**
- * 异步日志Appender：日志只入队，由后台线程批量写文件
- * 生产者（工作线程）调用log()只做内存入队，不碰磁盘；
- * 后台消费者线程批量取出、格式化、一次性写入文件，避免每条日志一次磁盘IO。
- * 队列有上限，满时丢弃并计数——日志允许丢失，业务线程不能被日志拖垮。
+ * 异步日志Appender：双缓冲 + 后台线程批量写文件
+ * 生产者（工作线程）调用log()只把日志指针写入"当前缓冲"（互斥锁保护，预分配无堆分配）；
+ * 缓冲写满或后台线程定时触发时交换两块缓冲，后台线程锁外整块格式化、写盘、发MQ。
+ * 两块缓冲都忙时丢弃并计数——日志允许丢失，业务线程不能被日志拖垮。
  */
 class AsyncLogAppender : public LogAppender
 {
@@ -27,9 +27,9 @@ public:
 
     /**
      * file: 日志文件路径
-     * maxQueueSize: 队列上限（满时丢弃）
-     * batchSize: 每批最多合并多少条日志写一次
-     * flushIntervalMs: 空闲时最多等多久唤醒一次（也用于批量攒日志）
+     * maxQueueSize: 每块缓冲容量（满时交换；两块都忙则丢弃）
+     * batchSize: 保留参数（兼容旧调用，双缓冲下不再使用）
+     * flushIntervalMs: 空闲时最多等多久触发一次落盘
      */
     AsyncLogAppender(const std::string& file,
                      size_t maxQueueSize = 10000,
@@ -57,13 +57,14 @@ private:
     std::string m_filename;
     std::ofstream m_filestream;   // 只由后台线程写
 
-    std::deque<LogEvent::ptr> m_queue;   // 有界队列（多生产者/单消费者）
+    std::array<std::vector<LogEvent::ptr>, 2> m_buf;  // 双缓冲：一块业务写入、一块后台落盘
+    std::array<bool, 2> m_busy{false, false};         // true=该块已交给后台线程（业务不可写）
+    int m_cur = 0;                                    // 业务当前写入的块索引
     std::mutex m_mutex;
     std::condition_variable m_cv;
 
     std::thread m_thread;
-    size_t m_maxQueueSize;
-    size_t m_batchSize;
+    size_t m_capacity;
     std::chrono::milliseconds m_flushInterval;
 
     std::unique_ptr<MqLogSender> m_mqSender;   // 可选的RabbitMQ发送器
@@ -83,10 +84,11 @@ inline AsyncLogAppender::AsyncLogAppender(const std::string& file,
                                           bool writeLocalFile)
     : LogAppender(LogFormatter::ptr(new LogFormatter))
     , m_filename(file)
-    , m_maxQueueSize(maxQueueSize)
-    , m_batchSize(batchSize)
+    , m_capacity(maxQueueSize)
     , m_flushInterval(std::chrono::milliseconds(flushIntervalMs))
 {
+    m_buf[0].reserve(m_capacity);
+    m_buf[1].reserve(m_capacity);
     if (writeLocalFile) {
         m_filestream.open(m_filename, std::ios::app);
     }
@@ -107,70 +109,97 @@ inline AsyncLogAppender::~AsyncLogAppender()
 inline void AsyncLogAppender::log(LogEvent::ptr event)
 {
     if (m_stopping) {
-        return; // 停止中丢弃；已入队的由worker排空
+        return; // 停止中丢弃；已入缓冲的由worker排空
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_queue.size() >= m_maxQueueSize) {
-        ++m_dropped; // 满时策略：丢弃+计数，业务不阻塞
-        return;
+    if (m_buf[m_cur].size() >= m_capacity) {
+        int other = 1 - m_cur;
+        if (m_busy[other]) {
+            ++m_dropped; // 两块都忙：丢弃+计数，业务不阻塞
+            return;
+        }
+        // 当前块写满：交给后台线程，切换到另一块继续写
+        m_busy[m_cur] = true;
+        m_cur = other;
+        m_cv.notify_one();
     }
-    m_queue.push_back(std::move(event));
-    m_cv.notify_one();
+    m_buf[m_cur].push_back(std::move(event));   // 已 reserve，不触发堆分配
 }
 
 inline void AsyncLogAppender::worker()
 {
-    std::vector<LogEvent::ptr> batch;
-    batch.reserve(m_batchSize);
+    LogFormatter::ptr fmt = m_formatter ? m_formatter : m_defaultFormatter;
 
     while (true) {
+        int take = -1;      // 要处理的块索引
+        size_t count = 0;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            // 等到有日志、或到flush间隔、或停止
+            // 等到有满块可处理、或到flush间隔、或停止
             m_cv.wait_for(lock, m_flushInterval,
-                          [this] { return m_stopping || !m_queue.empty(); });
+                          [this] { return m_stopping || m_busy[0] || m_busy[1]; });
 
-            // 取一批
-            while (!m_queue.empty() && batch.size() < m_batchSize) {
-                batch.push_back(std::move(m_queue.front()));
-                m_queue.pop_front();
+            // 空闲定时（或停止时）：把当前写块切出，保证低流量日志也及时落盘
+            int other = 1 - m_cur;
+            if (m_buf[m_cur].size() > 0 && !m_busy[other]) {
+                m_busy[m_cur] = true;
+                m_cur = other;
             }
 
-            if (batch.empty() && m_stopping) {
+            if (m_busy[0]) take = 0;
+            else if (m_busy[1]) take = 1;
+            if (take >= 0) count = m_buf[take].size();
+
+            if (take < 0 && m_stopping) {
                 break; // 队列排空，退出
             }
         }
 
-        // 锁外批量格式化 + 一次性写入文件
-        LogFormatter::ptr fmt = m_formatter ? m_formatter : m_defaultFormatter;
+        if (take < 0) continue;
+
+        // 锁外整块格式化 + 一次性写入文件 + 发MQ
         std::string out;
         std::string mqOut;   // 结构化JSON（多行），用于发送到RabbitMQ
-        for (auto& ev : batch) {
+        size_t mqCount = 0;
+        const size_t MQ_CHUNK = 200;   // MQ分块发送，避免单条消息过大
+        for (size_t i = 0; i < count; ++i) {
+            LogEvent::ptr& ev = m_buf[take][i];
             out += fmt->format(ev);
 
-            // 构造结构化JSON：消费者可以按level分文件、统计告警
-            nlohmann::json j;
-            j["logger"] = ev->getLoggerName();
-            j["level"]  = LogLevel::ToString(ev->getLevel());
-            j["time"]   = (long long)ev->getTime();
-            j["elapse_ms"] = ev->getElapse();
-            j["thread"] = ev->getThreadId();
-            j["fiber"]  = ev->getFiberId();
-            j["file"]   = ev->getFile();
-            j["line"]   = ev->getLine();
-            j["msg"]    = ev->getContent();
-            mqOut += j.dump() + "\n";
+            if (m_mqSender) {
+                nlohmann::json j;
+                j["logger"] = ev->getLoggerName();
+                j["level"]  = LogLevel::ToString(ev->getLevel());
+                j["time"]   = (long long)ev->getTime();
+                j["elapse_ms"] = ev->getElapse();
+                j["thread"] = ev->getThreadId();
+                j["fiber"]  = ev->getFiberId();
+                j["file"]   = ev->getFile();
+                j["line"]   = ev->getLine();
+                j["msg"]    = ev->getContent();
+                mqOut += j.dump() + "\n";
+                if (++mqCount >= MQ_CHUNK) {
+                    m_mqSender->publish(mqOut);
+                    mqOut.clear();
+                    mqCount = 0;
+                }
+            }
         }
         if (!out.empty() && m_filestream.is_open()) {
             m_filestream.write(out.data(), out.size());
             m_filestream.flush();
         }
-        // 本地写完后，顺带发到RabbitMQ（失败不影响本地日志）
-        if (m_mqSender) {
+        if (m_mqSender && !mqOut.empty()) {
             m_mqSender->publish(mqOut);
         }
-        batch.clear();
+
+        // 归还缓冲块（置空并标记空闲，供业务再次写入）
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_buf[take].clear();
+            m_busy[take] = false;
+        }
     }
 }
 

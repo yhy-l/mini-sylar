@@ -274,6 +274,7 @@
 #include <thread>
 #include <chrono>
 #include <filesystem>
+#include <cstdlib>
 
 namespace sylar {
     Logger::ptr g_logger = SYLAR_LOG_ROOT();
@@ -451,7 +452,9 @@ sylar::Task run_http_server(sylar::IOManager *iomptr) {
 
     // Redis：接口限流 + 实时统计（独立线程执行，不阻塞8个工作线程）
     auto redis = std::make_shared<sylar::RedisClient>(iomptr);
-    redis->init("127.0.0.1", 6379);
+    // 支持容器化：REDIS_HOST 环境变量（Docker 里指向 redis 服务名），默认本机
+    const char* redis_host = std::getenv("REDIS_HOST");
+    redis->init(redis_host ? redis_host : "127.0.0.1", 6379);
     httpserver->setRedisClient(redis);
     httpserver->setRateLimit("/api/limited", 10, 60);
     httpserver->setRateLimit("/api/echo", 100, 60);

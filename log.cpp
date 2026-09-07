@@ -3,6 +3,7 @@
 #include <utility>
 #include <chrono>
 #include <functional>
+#include <cstdlib>
 
 namespace sylar {
 
@@ -510,12 +511,14 @@ namespace sylar {
 
     LoggerManager::LoggerManager()
     {
+        // 支持容器化：MQ_HOST 环境变量（Docker 里指向 rabbitmq 服务名），默认本机
+        const char* mq_host = std::getenv("MQ_HOST");
         m_root.reset(new Logger("root"));
         m_root->addAppender(LogAppender::ptr(new StdoutLogAppender));
         // root日志也发到RabbitMQ（只发MQ，不写本地文件，避免和system的AsyncLogAppender抢同一个文件）
         m_root->addAppender(LogAppender::ptr(
             new sylar::AsyncLogAppender("../../log.txt", 10000, 100, 100,
-                                        true, "127.0.0.1", 5672, "logs",
+                                       true, mq_host ? mq_host : "127.0.0.1", 5672, "logs",
                                         false /*writeLocalFile*/)));
         m_loggers[m_root->getName()] = m_root;
         init();
