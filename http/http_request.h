@@ -12,6 +12,63 @@ namespace sylar {
     extern sylar::Logger::ptr g_logger;
 
     /**
+     * @brief HTTP 头部容器
+     *
+     * HTTP 报文头部通常只有几条到十几条。用 unordered_map 的代价是：
+     * 每插入一条都要算一次哈希、单独申请一个节点，遍历时缓存也不连续。
+     * 这里用一个小 vector 做线性查找：一次连续分配、遍历友好，
+     * 头部条数少时比哈希表更快，并且省掉每请求若干次节点分配。
+     */
+    class HeaderMap
+    {
+    public:
+        using Item = std::pair<std::string, std::string>;
+        using iterator = std::vector<Item>::iterator;
+        using const_iterator = std::vector<Item>::const_iterator;
+
+        HeaderMap() { m_items.reserve(4); }
+
+        /// 取某个头部的值；不存在则插入一个空值（和 map 的 operator[] 语义一致）
+        std::string& operator[](std::string key)
+        {
+            auto it = find(key);
+            if (it != m_items.end()) { return it->second; }
+            m_items.emplace_back(std::move(key), std::string());
+            return m_items.back().second;
+        }
+
+        iterator find(std::string_view key)
+        {
+            for (auto it = m_items.begin(); it != m_items.end(); ++it) {
+                if (it->first == key) { return it; }
+            }
+            return m_items.end();
+        }
+
+        const_iterator find(std::string_view key) const
+        {
+            for (auto it = m_items.begin(); it != m_items.end(); ++it) {
+                if (it->first == key) { return it; }
+            }
+            return m_items.end();
+        }
+
+        bool contains(std::string_view key) const { return find(key) != m_items.end(); }
+
+        iterator begin() { return m_items.begin(); }
+        iterator end() { return m_items.end(); }
+        const_iterator begin() const { return m_items.begin(); }
+        const_iterator end() const { return m_items.end(); }
+
+        size_t size() const { return m_items.size(); }
+        bool empty() const { return m_items.empty(); }
+        void clear() { m_items.clear(); }
+
+    private:
+        std::vector<Item> m_items;
+    };
+
+    /**
  * http请求结构体，用于接受客户端的请求
  */
     struct HttpRequest
@@ -21,7 +78,7 @@ namespace sylar {
         std::string version; //版本
 
         //请求头部  key-request格式
-        std::unordered_map<std::string, std::string> headers;
+        HeaderMap headers;
 
         std::string body; //请求体
 
@@ -66,7 +123,7 @@ namespace sylar {
             std::string lower_key = key;
             std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            return headers.find(lower_key) != headers.end();
+            return headers.contains(lower_key);
         }
 
         /**
@@ -114,7 +171,7 @@ namespace sylar {
         std::string status_text = "OK"; //状态文本
 
         // 头部
-        std::unordered_map<std::string, std::string> headers;
+        HeaderMap headers;
 
         // 响应体
         std::string body;
@@ -132,22 +189,33 @@ namespace sylar {
      */
         std::string to_string() const
         {
-            std::string respone;
-
-            //  状态行：HTTP/1.1 200 OK\r\n
-            respone = version + " " + std::to_string(status_code) + " " + status_text + "\r\n";
-
-            //  头部
-            for (const auto& [key, value] : headers) {
-                respone += key + ": " + value + "\r\n";
+            // 预估总长度，一次 reserve，避免多次扩容与临时 string 构造
+            size_t estimate = version.size() + status_text.size() + 16 + body.size() + 2;
+            for (const auto& kv : headers) {
+                estimate += kv.first.size() + kv.second.size() + 4;
             }
 
-            // 空行
-            respone += "\r\n";
+            std::string respone;
+            respone.reserve(estimate);
 
-            //  响应体
-            respone += body;
+            // 状态行：HTTP/1.1 200 OK\r\n
+            respone.append(version);
+            respone.push_back(' ');
+            respone.append(std::to_string(status_code));
+            respone.push_back(' ');
+            respone.append(status_text);
+            respone.append("\r\n");
 
+            // 头部
+            for (const auto& kv : headers) {
+                respone.append(kv.first);
+                respone.append(": ");
+                respone.append(kv.second);
+                respone.append("\r\n");
+            }
+
+            respone.append("\r\n");
+            respone.append(body);
             return respone;
         }
 

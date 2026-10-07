@@ -77,7 +77,13 @@ namespace sylar {
         /**
      * 设置读取超时时间(毫秒)
      */
-        void setRecvTimeout(uint64_t v) { m_recvTimeout = v;}
+    void setRecvTimeout(uint64_t v) { m_recvTimeout = v;}
+
+    /**
+     * 是否允许同一端口多实例监听（SO_REUSEPORT）
+     * 开启后内核按连接四元组哈希分发到不同监听 fd，可实现多事件循环并行
+     */
+    void setReusePort(bool v) { m_reusePort = v; }
 
         /**
      * 设置服务器名称
@@ -100,7 +106,18 @@ namespace sylar {
          * self: 持有服务器自身的shared_ptr，保证协程运行期间服务器不会被销毁
          * client: 客户端连接
          */
-        virtual Task handleClient(std::shared_ptr<TcpServer> self, Socket::ptr client);
+    /**
+     * 处理一个客户端连接
+     * iom: 处理该连接的IO实例（可为空，默认用 m_ioWorker）。
+     *      支持"accept线程按负载把连接分发给其他IO实例"的架构。
+     */
+    virtual Task handleClient(std::shared_ptr<TcpServer> self, Socket::ptr client,
+                              sylar::IOManager* iom = nullptr);
+
+    /**
+     * 选择处理新连接的IO实例（默认用 m_ioWorker，子类可重写实现负载分发）
+     */
+    virtual sylar::IOManager* pickIoWorker() { return m_ioWorker; }
 
         /**
          * 开始接受连接
@@ -145,7 +162,10 @@ namespace sylar {
         std::string m_type;
 
         /// 服务是否停止
-        bool m_isStop;
+    bool m_isStop;
+
+    /// 是否使用 SO_REUSEPORT（多实例监听同一端口）
+    bool m_reusePort = false;
     };
 
 } // namespace sylar

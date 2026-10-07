@@ -1,0 +1,33 @@
+upstream backend {
+    server mini-sylar-1:8080;
+    server mini-sylar-2:8080;
+    server mini-sylar-3:8080;
+    keepalive 100;
+}
+
+server {
+    listen 80;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # 静态文件直接返回
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # API 反向代理到后端（负载均衡）
+    location /api/ {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location = /text {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+}

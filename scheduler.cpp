@@ -21,27 +21,33 @@ namespace sylar {
 
     void Scheduler::schedule(Task task)
     {
+        bool need_start = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_task.push(std::move(task));
-            SYLAR_LOG_DEBUG(SYLAR_LOG_NAME("system")) << "添加任务，队列大小: " << m_task.size();
+            SYLAR_LOG_DEBUG(g_logger) << "添加任务，队列大小: " << m_task.size();
 
             if (!is_start)
             {
                 is_start = true;
-
+                need_start = true;
             }
         }
 
-        if(is_start)
-            start();
+        // 只启动一次工作线程；之前每次schedule都调start()，
+        // 会在没有锁保护的情况下读 m_workers（vector），属于数据竞争。
+        if (need_start) start();
 
-        tickle();
+        // 同线程入队不需要唤醒：调用方正在这个调度器自己的线程上跑，
+        // 处理完手上这一轮就会回到任务队列取任务。
+        // 只有跨线程投递才需要 tickle()（IOManager 会写唤醒管道唤醒 epoll_wait）。
+        // 之前每次入队都唤醒，等于每个请求白搭一次 write 系统调用。
+        if (GetThis() != this) tickle();
     }
 
     void Scheduler::start()
     {
-        SYLAR_LOG_DEBUG(SYLAR_LOG_NAME("system")) << "执行start函数";
+        SYLAR_LOG_DEBUG(g_logger) << "执行start函数";
         // g_logger->setLevel(sylar::LogLevel::DEBUG);
         if (!m_workers.empty()) { return; }
 
@@ -66,6 +72,9 @@ namespace sylar {
         }
 
         m_cv.notify_all();
+        // 工作线程空闲时阻塞在子类的 idle()（IOManager 是 epoll_wait）而不是条件变量上，
+        // 所以还要走一次 tickle()，把睡在 epoll_wait 里的线程叫醒，否则 join 会一直等。
+        tickle();
 
         for (auto& worker : m_workers) {
             if (worker.joinable()) { worker.join(); }
@@ -81,35 +90,37 @@ namespace sylar {
         while (true)
         {
             Task task;
-            bool has_task = false;
 
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
 
-                if (m_task.empty()) ++m_idleThreadCount;
+                if (m_task.empty()) {
+                    // 队列空且需要停止：退出
+                    if (m_stopping) { break; }
 
-                //等待条件 ： 有任务或需要停止
-                m_cv.wait_for(lock, std::chrono::milliseconds(10),
-                              [this]() { return m_stopping || !m_task.empty(); });
-
-                if (m_task.empty()) --m_idleThreadCount;
-
-                //需要停止并且没有任务
-                if (m_stopping && m_task.empty())
-                {
-                    break;
+                    // 队列空：直接进入空闲等待。
+                    // IOManager 的 idle() 会阻塞在 epoll_wait 上，IO 事件一到就返回；
+                    // 不能在这里用条件变量睡固定时长（之前是 wait_for 10ms），
+                    // 否则每处理完一个请求都会先白等一个超时周期才回去收 IO 事件。
+                    //
+                    // "我要睡了"必须在锁内登记：此刻之后 schedule() 入队的任务
+                    // 会在 tickle() 里看到 idleThreadCount>0 并写唤醒管道，
+                    // 不会出现任务已入队却没人被叫醒的丢唤醒。
+                    ++m_idleThreadCount;
+                    lock.unlock();
+                    idle();
+                    lock.lock();
+                    --m_idleThreadCount;
+                    continue;   // 回到顶部重新取任务
                 }
 
-                if (!m_task.empty()) {
-                    task = std::move(m_task.front());
-                    m_task.pop();
-                    has_task = true;
-                    SYLAR_LOG_DEBUG(g_logger) << "取出任务，队列剩余: " << m_task.size();
-                }
+                task = std::move(m_task.front());
+                m_task.pop();
+                SYLAR_LOG_DEBUG(g_logger) << "取出任务，队列剩余: " << m_task.size();
             }
 
 
-            if (task.getHandle() && has_task)
+            if (task.getHandle())
             {
                 SYLAR_LOG_DEBUG(g_logger) << "执行任务";
 
@@ -151,11 +162,6 @@ namespace sylar {
                 }
 
             }
-            else
-            {
-                SYLAR_LOG_DEBUG(g_logger) << "进入idle";
-                idle();
-            }
 
         }
 
@@ -175,4 +181,3 @@ namespace sylar {
 
 
 }   //namespace sylar
-

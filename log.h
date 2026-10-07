@@ -585,5 +585,17 @@ namespace sylar {
         Logger::ptr m_root;
     };
 
+    /**
+     * @brief 获取缓存的 system 日志器
+     *
+     * SYLAR_LOG_NAME("system") 每次调用都要在 LoggerManager 的全局锁下查表，
+     * 放在"每请求都要执行"的热路径上会变成多线程锁竞争点。
+     * 这里用函数内静态变量缓存一次，之后只是返回已有智能指针的引用。
+     */
+    inline const Logger::ptr& SystemLogger()
+    {
+        static Logger::ptr s_logger = LoggerManager::getInstance().getLogger("system");
+        return s_logger;
+    }
 
 }

@@ -433,11 +433,8 @@ void printServerConnectInfoTCP(int port) {
     SYLAR_LOG_INFO(sylar::g_logger) << "========================================";
 }
 
-// 运行HTTP服务器的协程任务
-sylar::Task run_http_server(sylar::IOManager *iomptr) {
-    // 创建HTTP服务器实例
-    auto httpserver = std::make_shared<sylar::HttpServer>(iomptr,iomptr);
-
+// 配置一个HTTP服务器实例（路由 / 静态目录 / Redis限流统计）
+void setup_http_server(sylar::HttpServer::ptr httpserver, sylar::RedisClient::ptr redis) {
     // 静态文件目录：兼容从项目根目录或build/目录启动
     httpserver->setStaticDir(std::filesystem::exists("web") ? "web" : "../web");
 
@@ -450,46 +447,41 @@ sylar::Task run_http_server(sylar::IOManager *iomptr) {
         return sylar::HttpResponse::make_json_response(json);
     });
 
-    // Redis：接口限流 + 实时统计（独立线程执行，不阻塞8个工作线程）
-    auto redis = std::make_shared<sylar::RedisClient>(iomptr);
-    // 支持容器化：REDIS_HOST 环境变量（Docker 里指向 redis 服务名），默认本机
-    const char* redis_host = std::getenv("REDIS_HOST");
-    redis->init(redis_host ? redis_host : "127.0.0.1", 6379);
+    // Redis：接口限流 + 实时统计
+    // 所有实例共享一个RedisClient（独立线程执行）；任务携带ownerIom，唤醒时回到各自实例
     httpserver->setRedisClient(redis);
     httpserver->setRateLimit("/api/limited", 10, 60);
     httpserver->setRateLimit("/api/echo", 100, 60);
 
-    SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器路由已注册";
+    // HTTP_STATS=0 关闭Redis实时统计上报（压测/降级场景）
+    if (const char* stats = std::getenv("HTTP_STATS")) {
+        if (std::string(stats) == "0") { httpserver->setStatsEnabled(false); }
+    }
+}
 
-    // 创建地址
+// 每个HTTP实例对应一个协程：绑定地址 → 启动 → 等待停止 → 优雅关停
+sylar::Task run_http_instance(sylar::IOManager* iom, sylar::HttpServer::ptr httpserver) {
     sylar::IPv4Address::ptr server_addr = sylar::IPv4Address::Create("0.0.0.0", g_http_port);
 
-    // 绑定地址
     std::vector<sylar::Address::ptr> addrs;
     addrs.push_back(server_addr);
     std::vector<sylar::Address::ptr> fails;
 
-    while(!httpserver->bind(addrs, fails)) {
-        SYLAR_LOG_ERROR(sylar::g_logger) << "HTTP服务器绑定地址失败";
+    if (!httpserver->bind(addrs, fails)) {
+        SYLAR_LOG_ERROR(sylar::g_logger) << "HTTP实例绑定地址失败";
         co_return;
     }
-
-    SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器绑定成功: " << httpserver->toString();
-
-    // 打印连接信息
-    printServerConnectInfo(g_http_port);
-
-    // 启动服务器
     httpserver->start();
-    SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器已启动";
 
-    // 挂起协程，保持httpserver对象存活，直到IOManager停止
-    co_await iomptr->waitStopAsync();
-
-    // 优雅关停：关闭监听socket和所有活动客户端连接
+    // 挂起协程，保持server对象存活，直到本实例的IOManager停止
+    co_await iom->waitStopAsync();
     httpserver->stop();
+    co_return;
+}
 
-    SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器已停止";
+// 占位协程：让IO实例的线程启动并保持运行（该实例只处理被分发过来的连接）
+sylar::Task hold_instance(sylar::IOManager* iom) {
+    co_await iom->waitStopAsync();
     co_return;
 }
 
@@ -541,30 +533,71 @@ int main(int argc, char** argv)
     SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器启动";
     SYLAR_LOG_INFO(sylar::g_logger) << "========================================";
 
-    // 创建IOManager（协程调度器）
-    // 参数1: 工作线程数
-    // 参数2: 是否将调用线程也用作工作线程
-    sylar::IOManager iom(8,true);
-
     // 设置信号处理：只标记退出请求，不再在信号处理器里做任何非安全操作
     signal(SIGINT, [](int) { g_stop_requested = true; });
     signal(SIGTERM, [](int) { g_stop_requested = true; });
+    // 网络写失败必须由 send 返回错误来处理，不能让 SIGPIPE 直接杀进程
+    signal(SIGPIPE, SIG_IGN);
 
-    // 启动HTTP服务器
-    iom.schedule(run_http_server(&iom));
+    // 多实例架构：N 个实例，每个 = 1个线程 + 1个独立epoll（多事件循环并行）
+    // 连接分发采用"单监听 + 轮转分发"：只由 iom[0] 接受连接，
+    // 再按轮转把连接交给各实例的 epoll 处理，避免 SO_REUSEPORT 哈希分发不均
+    // （哈希分发会把多数连接集中到少数实例，其他实例空转）
+    size_t kHttpInstances = 12;
+    if (const char* env = std::getenv("HTTP_INSTANCES")) {
+        size_t v = (size_t)std::atoi(env);
+        if (v > 0) kHttpInstances = v;
+    }
+    std::vector<sylar::IOManager::ptr> httpIoms;
+    sylar::RedisClient::ptr redis;
 
-    //启动TCP服务器
-    iom.schedule(run(&iom));
+    for (size_t i = 0; i < kHttpInstances; ++i) {
+        auto iom = std::make_shared<sylar::IOManager>(1, false);
+        if (i == 0) {
+            // Redis客户端被所有实例共享；任务携带ownerIom，唤醒时回到原实例
+            const char* redis_host = std::getenv("REDIS_HOST");
+            redis = std::make_shared<sylar::RedisClient>(iom.get());
+            redis->init(redis_host ? redis_host : "127.0.0.1", 6379);
+        }
+        httpIoms.push_back(iom);
+
+        if (i > 0) {
+            // 其余实例：调度一个占位协程让线程启动并保持运行（只处理被分发的连接）
+            iom->schedule(hold_instance(iom.get()));
+        }
+    }
+
+    // 单一监听 + 轮转分发：accept 线程收到连接后按顺序分给各实例
+    std::vector<sylar::IOManager*> ioTargets;
+    for (auto& iom : httpIoms) { ioTargets.push_back(iom.get()); }
+
+    auto httpserver = std::make_shared<sylar::HttpServer>(httpIoms[0].get(), httpIoms[0].get());
+    setup_http_server(httpserver, redis);
+    httpserver->setIoManagers(ioTargets);
+    httpIoms[0]->schedule(run_http_instance(httpIoms[0].get(), httpserver));
+
+    // TCP服务器：单独一个实例
+    auto tcpIom = std::make_shared<sylar::IOManager>(1, false);
+    tcpIom->schedule(run(tcpIom.get()));
+
+    // 打印连接信息
+    printServerConnectInfo(g_http_port);
 
     // 等待服务器停止
-    SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器正在运行，按Ctrl+C停止";
+    SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器正在运行（" << kHttpInstances
+                                    << " 个实例），按Ctrl+C停止";
 
     // 主线程循环等待退出请求，收到后再在主线程安全地执行关停
     while (!g_stop_requested) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     SYLAR_LOG_INFO(sylar::g_logger) << "收到停止请求，开始关停...";
-    iom.stop();
+    for (auto& iom : httpIoms) {
+        iom->stop();
+    }
+    if (tcpIom) {
+        tcpIom->stop();
+    }
 
     SYLAR_LOG_INFO(sylar::g_logger) << "========================================";
     SYLAR_LOG_INFO(sylar::g_logger) << "HTTP服务器已退出";

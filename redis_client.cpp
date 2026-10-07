@@ -72,6 +72,7 @@ void RedisClient::countAsync(const std::string& cmd)
 void RedisClient::submit(QueueTask t)
 {
     std::coroutine_handle<> dropWaiter;
+    IOManager* dropOwner = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_queue.size() >= m_maxQueueSize) {
@@ -79,6 +80,7 @@ void RedisClient::submit(QueueTask t)
             ++m_dropped;
             if (t.results) t.results->assign(t.cmds.size(), "-1");
             dropWaiter = t.waiter;
+            dropOwner = t.ownerIom;
         } else {
             m_queue.push_back(std::move(t));
             m_cv.notify_one();
@@ -87,7 +89,7 @@ void RedisClient::submit(QueueTask t)
     }
     // 锁外唤醒（不能持 m_mutex 调 schedule，避免锁序交叉）
     if (dropWaiter) {
-        m_iom->schedule(Task(dropWaiter));
+        (dropOwner ? dropOwner : m_iom)->schedule(Task(dropWaiter));
     }
 }
 
@@ -142,24 +144,26 @@ void RedisClient::worker()
 
         // 唤醒等待的协程：交回调度队列，等某个工作线程 resume
         if (t.waiter) {
-            m_iom->schedule(Task(t.waiter));
+            (t.ownerIom ? t.ownerIom : m_iom)->schedule(Task(t.waiter));
         }
     }
 
     // 退出前：唤醒队列里还挂着的协程（关停场景），避免协程帧泄漏
-    std::vector<std::coroutine_handle<>> leftovers;
+    std::vector<std::pair<std::coroutine_handle<>, IOManager*>> leftovers;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         while (!m_queue.empty()) {
             if (m_queue.front().results) {
                 m_queue.front().results->assign(m_queue.front().cmds.size(), "-1");
             }
-            if (m_queue.front().waiter) leftovers.push_back(m_queue.front().waiter);
+            if (m_queue.front().waiter) {
+                leftovers.emplace_back(m_queue.front().waiter, m_queue.front().ownerIom);
+            }
             m_queue.pop_front();
         }
     }
-    for (auto h : leftovers) {
-        m_iom->schedule(Task(h));
+    for (auto& kv : leftovers) {
+        (kv.second ? kv.second : m_iom)->schedule(Task(kv.first));
     }
 }
 

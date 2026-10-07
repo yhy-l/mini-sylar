@@ -9,6 +9,7 @@
 #include <memory>
 #include <cstring>
 #include <ctime>
+#include <chrono>
 #include "../log.h"
 #include "../task.h"
 #include "../getFileDate.h"
@@ -33,6 +34,97 @@ namespace sylar {
 
         /// 接口限流规则："METHOD:path" -> {窗口内上限, 窗口秒数}
         std::unordered_map<std::string, std::pair<int, int>> m_rateLimits;
+
+        /// 是否向 Redis 上报实时统计（压测/降级时可关闭，避免统计影响主链路）
+        bool m_statsEnabled = true;
+
+        /**
+         * 线程本地统计聚合
+         *
+         * 统计计数先在内存里累加，攒够一批或超过刷新间隔后，
+         * 才合并成少量 Redis 命令发出去。
+         * 之前每处理一个请求就要拼 3 条命令字符串再入队，
+         * 高频压测下光字符串构造和队列加锁就吃掉了两成吞吐。
+         */
+        struct LocalStats
+        {
+            long long total = 0;                             ///< 本批请求总数
+            long long connDelta = 0;                         ///< 本批在线连接数变化
+            std::unordered_map<std::string, long long> api;   ///< "GET:/health" -> 次数
+            std::unordered_map<int, long long> status;        ///< 状态码 -> 次数
+            uint64_t nextFlushMs = 0;                        ///< 最迟刷新时间
+        };
+
+        static constexpr long long kStatsBatch = 1024;       ///< 攒够多少请求合并上报
+        static constexpr uint64_t kStatsIntervalMs = 1000;   ///< 最长多久上报一次
+
+        static uint64_t nowMs()
+        {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+
+        /**
+         * 当前线程的统计槽：每个实例只有一个工作线程，
+         * 请求处理和刷新都在同一线程上，不需要加锁。
+         */
+        static LocalStats& localStats()
+        {
+            static thread_local LocalStats s_stats;
+            return s_stats;
+        }
+
+        /// 把本地累积的计数合并成少量命令发给 Redis（只在该线程调用）
+        void flush_stats()
+        {
+            LocalStats& s = localStats();
+            if (m_redis && m_statsEnabled) {
+                if (s.connDelta != 0) {
+                    m_redis->countAsync("INCRBY stats:conns " + std::to_string(s.connDelta));
+                }
+                if (s.total != 0) {
+                    m_redis->countAsync("INCRBY stats:total " + std::to_string(s.total));
+                }
+                for (const auto& kv : s.api) {
+                    m_redis->countAsync("HINCRBY stats:api " + kv.first + " " +
+                                        std::to_string(kv.second));
+                }
+                for (const auto& kv : s.status) {
+                    m_redis->countAsync("HINCRBY stats:status " + std::to_string(kv.first) + " " +
+                                        std::to_string(kv.second));
+                }
+            }
+            s.total = 0;
+            s.connDelta = 0;
+            s.api.clear();
+            s.status.clear();
+            s.nextFlushMs = nowMs() + kStatsIntervalMs;
+        }
+
+        /// 记录一次请求结果；攒够一批或到时间就上报
+        void record_stats(const std::string& method, const std::string& path, int status)
+        {
+            if (!m_redis || !m_statsEnabled) { return; }
+            LocalStats& s = localStats();
+            ++s.total;
+            ++s.api[method + ":" + path];
+            ++s.status[status];
+            if (s.total >= kStatsBatch || nowMs() >= s.nextFlushMs) { flush_stats(); }
+        }
+
+        /// 记录连接数变化
+        void record_conn(long long delta)
+        {
+            if (!m_redis || !m_statsEnabled) { return; }
+            LocalStats& s = localStats();
+            s.connDelta += delta;
+            if (nowMs() >= s.nextFlushMs) { flush_stats(); }
+        }
+
+        /// 可分发连接的IO实例列表（负载分发用；为空则所有连接由 m_ioWorker 处理）
+        std::vector<sylar::IOManager*> m_ioManagers;
+        /// 轮转下标
+        size_t m_nextIoIndex = 0;
 
         /**
          * 非阻塞发送：循环发送直到全部发出或遇到 EAGAIN（缓冲满）
@@ -134,6 +226,8 @@ namespace sylar {
 
     public:
 
+        using ptr = std::shared_ptr<HttpServer>;
+
         HttpServer(sylar::IOManager* io_worker = sylar::IOManager::GetThis(),
                    sylar::IOManager* accept_worker = sylar::IOManager::GetThis())
             : TcpServer(io_worker, accept_worker) {
@@ -156,9 +250,30 @@ namespace sylar {
         void setStaticDir(const std::string& dir) { m_staticDir = dir; }
 
         /**
+         * @brief 设置可分发连接的IO实例列表（accept线程按轮转把连接分给它们）
+         */
+        void setIoManagers(const std::vector<sylar::IOManager*>& ioms) { m_ioManagers = ioms; }
+
+        /**
+         * @brief 选择处理新连接的IO实例：轮转分发，保证各实例负载均匀
+         */
+        sylar::IOManager* pickIoWorker() override
+        {
+            if (m_ioManagers.empty()) { return m_ioWorker; }
+            sylar::IOManager* target = m_ioManagers[m_nextIoIndex % m_ioManagers.size()];
+            ++m_nextIoIndex;
+            return target ? target : m_ioWorker;
+        }
+
+        /**
          * 挂载 Redis 客户端（限流 + 实时统计）
          */
         void setRedisClient(RedisClient::ptr redis) { m_redis = std::move(redis); }
+
+        /**
+         * 开关 Redis 实时统计上报
+         */
+        void setStatsEnabled(bool on) { m_statsEnabled = on; }
 
         /**
          * 配置接口限流：每 IP 在 windowSec 秒内最多访问 limit 次，超限返回 429
@@ -209,6 +324,16 @@ namespace sylar {
                 return HttpResponse::make_json_response(json);
             });
 
+            /// 健康检查接口：最简响应（返回固定短文本），用于压测对比与探活
+            get("/health", [](const HttpRequest& req) {
+                (void)req;
+                HttpResponse res;
+                res.set_content_type("text/plain");
+                res.body = "OK";
+                res.auto_set_content_length();
+                return res;
+            });
+
             /// 返回当前时间的API
             get("/api/time", [](const HttpRequest& req) {
                 time_t now = time(nullptr);
@@ -253,18 +378,22 @@ Line 3)";
             });
         }
 
-        sylar::Task handleClient(std::shared_ptr<TcpServer> self, Socket::ptr client) override
+        sylar::Task handleClient(std::shared_ptr<TcpServer> self, Socket::ptr client,
+                                 sylar::IOManager* iom = nullptr) override
         {
             (void) self; // 仅用于在协程帧中持有服务器，保证服务器存活
+            if (!iom) { iom = m_ioWorker; }   // 未指定实例则用默认IO实例
             SYLAR_LOG_INFO(g_logger) << "====== HttpServer::handleClient 被调用 ======";
             SYLAR_LOG_INFO(g_logger) << "客户端: " << client->toString();
 
             // 在线连接数 +1（fire-and-forget，不等结果）
-            if (m_redis) {
-                m_redis->countAsync("INCR stats:conns");
-            }
+            // 在线连接数 +1（本地先累加，攒批上报）
+            record_conn(1);
 
-            char buffer[4096];
+            // 接收暂存区放在线程局部，不再占用协程帧：
+            // 每条连接少 4KB，高并发下连接容量直接受益。
+            // 安全前提：从buffer读到的数据会立刻拷贝进read_buffer，中间没有挂起点。
+            static thread_local char buffer[4096];
             std::string read_buffer; // 累积缓冲：一个请求可能分多次到达，也可能一次到达多个
 
             while (true) {
@@ -274,47 +403,50 @@ Line 3)";
                 size_t total_len = std::string::npos;
                 if (header_end != std::string::npos) {
                     size_t body_len = 0;
-                    HttpParser::find_content_length(read_buffer.substr(0, header_end), body_len);
+                    // string_view 零拷贝：不再为 header 块构造临时 string
+                    HttpParser::find_content_length(
+                        std::string_view(read_buffer).substr(0, header_end), body_len);
                     total_len = header_end + 4 + body_len;
                 }
 
                 if (header_end == std::string::npos || read_buffer.size() < total_len) {
-                    // 缓冲里的数据不足一个完整请求，等待更多数据
-                    bool ready = co_await m_ioWorker->waitReadAsync(client->getSocket(), 5000);
-
+                    // 数据不足一个完整请求。epoll 读事件是常驻注册的（触发后不清除），
+                    // 处理上一个请求期间到达的数据可能已经错过通知，所以先非阻塞读一次；
+                    // 有数据就直接处理，确实没数据才挂起等事件。
+                    ssize_t n = client->recv(buffer, sizeof(buffer) - 1);
+                    if (n > 0) {
+                        read_buffer.append(buffer, n);
+                        SYLAR_LOG_INFO(g_logger) << "收到数据，本次: " << n
+                                                 << " 字节，累积: " << read_buffer.size() << " 字节";
+                        continue;      // 回到循环顶部，重新尝试切分请求
+                    }
+                    if (n < 0) {
+                        SYLAR_LOG_ERROR(g_logger) << "recv错误: " << strerror(errno);
+                        break;
+                    }
+                    if (!client->isConnected()) {
+                        SYLAR_LOG_INFO(g_logger) << "客户端正常关闭连接";
+                        break;         // 对端关闭（EOF）
+                    }
+                    // n == 0 且连接仍有效 = EAGAIN：当前无数据可读，挂起等 IO 事件
+                    bool ready = co_await iom->waitReadAsync(client->getSocket(), 5000);
                     if (!ready || m_isStop) {
                         SYLAR_LOG_INFO(g_logger) << "等待读取超时或服务器停止";
                         break;
                     }
-
-                    // 读取数据
-                    ssize_t n = client->recv(buffer, sizeof(buffer) - 1);
-                    if (n <= 0) {
-                        if (n == 0) {
-                            SYLAR_LOG_INFO(g_logger) << "客户端正常关闭连接";
-                        } else {
-                            SYLAR_LOG_ERROR(g_logger) << "recv错误: " << strerror(errno);
-                        }
-                        break;
-                    }
-
-                    read_buffer.append(buffer, n);
-                    SYLAR_LOG_INFO(g_logger) << "收到数据，本次: " << n
-                                             << " 字节，累积: " << read_buffer.size() << " 字节";
-                    continue;
+                    continue;          // 事件到达，回到顶部再尝试预读
                 }
 
                 // 第二步：缓冲里已有一条完整请求，取出来处理
-                std::string request_str = read_buffer.substr(0, total_len);
-                read_buffer.erase(0, total_len);
-
                 SYLAR_LOG_INFO(g_logger) << "收到完整HTTP请求，长度: " << total_len;
-                SYLAR_LOG_DEBUG(g_logger) << "请求内容: " << request_str;
 
-                // 解析请求
+                // 解析请求：直接用 read_buffer 的 view（零拷贝），
+                // 解析会把需要的字段拷贝进 req，之后再从缓冲移除已消费字节
                 HttpRequest req;
-                if (!HttpParser::parse_request(request_str, req)) {
+                if (!HttpParser::parse_request(
+                        std::string_view(read_buffer).substr(0, total_len), req)) {
                     SYLAR_LOG_ERROR(g_logger) << "解析HTTP请求失败";
+                    read_buffer.erase(0, total_len);
 
                     // 发送400错误响应：先直接发，缓冲满才挂起等可写
                     HttpResponse bad_req = HttpResponse::make_error_response(400, "Bad Request");
@@ -323,7 +455,7 @@ Line 3)";
                     size_t sent_off = 0;
                     int sret = send_nonblocking(client, response_str, sent_off);
                     while (sret == 0) {
-                        bool write_ready = co_await m_ioWorker->waitWriteAsync(client->getSocket(), 5000);
+                        bool write_ready = co_await iom->waitWriteAsync(client->getSocket(), 5000);
                         if (!write_ready) {
                             SYLAR_LOG_WARN(g_logger) << "等待写入超时";
                             break;
@@ -339,6 +471,9 @@ Line 3)";
                 }
 
                 SYLAR_LOG_INFO(g_logger) << "解析请求成功: " << req.method << " " << req.path;
+
+                // 已消费的字节从缓冲移除（view 解析完成后再 erase）
+                read_buffer.erase(0, total_len);
 
                 // —— Redis 限流 / 实时统计 ——
                 HttpResponse res;
@@ -399,11 +534,7 @@ Line 3)";
                 }
 
                 // —— 统计上报（fire-and-forget，不阻塞）——
-                if (m_redis) {
-                    m_redis->countAsync("INCR stats:total");
-                    m_redis->countAsync("HINCRBY stats:api " + req.method + ":" + req.path + " 1");
-                    m_redis->countAsync("HINCRBY stats:status " + std::to_string(res.status_code) + " 1");
-                }
+                record_stats(req.method, req.path, res.status_code);
 
                 if (req.is_keep_alive()) {
                     res.headers["Connection"] = "keep-alive";
@@ -418,7 +549,7 @@ Line 3)";
                 size_t sent_off = 0;
                 int sret = send_nonblocking(client, response_str, sent_off);
                 while (sret == 0) {
-                    bool write_ready = co_await m_ioWorker->waitWriteAsync(client->getSocket(), 5000);
+                    bool write_ready = co_await iom->waitWriteAsync(client->getSocket(), 5000);
                     if (!write_ready) {
                         SYLAR_LOG_WARN(g_logger) << "等待写入超时";
                         break;
@@ -440,10 +571,11 @@ Line 3)";
                 SYLAR_LOG_DEBUG(g_logger) << "长连接，回到循环检查下一个请求";
             }
 
+            // 读事件是常驻注册的：连接结束前先把它从epoll摘掉，再关fd，避免遗留上下文
+            if (iom) { iom->cancelAll(client->getSocket()); }
             client->close();
-            if (m_redis) {
-                m_redis->countAsync("DECR stats:conns");   // 在线连接数 -1
-            }
+            record_conn(-1);      // 在线连接数 -1
+            flush_stats();        // 连接结束时把本线程剩下没上报的计数冲出去
             removeClient(client);
             SYLAR_LOG_INFO(g_logger) << "连接已关闭";
             co_return;

@@ -48,7 +48,7 @@ namespace sylar {
         ~Task()
         {
             if (m_handle && m_handle.done()) {
-                SYLAR_LOG_DEBUG(SYLAR_LOG_NAME("system")) << "销毁句柄！！！！";
+                SYLAR_LOG_DEBUG(SystemLogger()) << "销毁句柄！！！！";
                 m_handle.destroy();
             }
         }
@@ -81,7 +81,7 @@ namespace sylar {
                         m_handle.destroy();
                     } else {
                         // 未完成的帧可能仍被IOManager引用（WAITING_IO），不能销毁
-                        SYLAR_LOG_WARN(SYLAR_LOG_NAME("system"))
+                        SYLAR_LOG_WARN(SystemLogger())
                             << "移动赋值丢弃未完成协程句柄: " << m_handle.address();
                     }
                 }
@@ -99,11 +99,11 @@ namespace sylar {
             {
                 auto& pr = std::coroutine_handle<Task::promise_type>::from_address(m_handle.address()).promise();
                 if (pr.resuming.exchange(true)) {
-                    SYLAR_LOG_FATAL(SYLAR_LOG_NAME("system"))
+                    SYLAR_LOG_FATAL(SystemLogger())
                         << "检测到并发双重resume! 句柄=" << m_handle.address();
                     std::abort();
                 }
-                SYLAR_LOG_DEBUG(SYLAR_LOG_NAME("system")) << "恢复协程，句柄: " << m_handle.address();
+                SYLAR_LOG_DEBUG(SystemLogger()) << "恢复协程，句柄: " << m_handle.address();
                 auto prev = t_current;
                 t_current = m_handle;
                 m_handle.resume();
@@ -112,7 +112,7 @@ namespace sylar {
             }
             else
             {
-                SYLAR_LOG_DEBUG(SYLAR_LOG_NAME("system")) << "无法恢复协程，句柄: " << m_handle.address()
+                SYLAR_LOG_DEBUG(SystemLogger()) << "无法恢复协程，句柄: " << m_handle.address()
                     << "，完成状态: " << (m_handle ? m_handle.done() : true);
             }
         }

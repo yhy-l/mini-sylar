@@ -58,6 +58,9 @@ namespace sylar {
         bool isStopping() const { return m_stopping; }
 
     protected:
+        /// 工作线程数量（子类判断是否单线程实例用）
+        size_t workerCount() const { return m_threadCount; }
+
         /**
          * 工作线程启动时的钩子，子类可重写（比如IOManager用来设置线程局部IO管理器）
          */

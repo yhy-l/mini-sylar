@@ -98,3 +98,6 @@ log.txt
 .vscode/
 高性能服务器.txt
 Docker容器化部署.txt
+
+# 开发过程中用到的临时诊断/压测脚本（本地保留，不入库）
+dev-scripts/

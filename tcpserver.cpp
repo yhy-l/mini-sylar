@@ -109,13 +109,21 @@ namespace sylar {
     {
         for (auto& addr : addrs) {
             Socket::ptr sock = Socket::CreateTCP(addr);
+            if (m_reusePort) {
+                // 多实例监听同一端口：内核按四元组哈希分发连接，无惊群
+                // 注意 fd 在 bind 内部才创建，所以这里只设标志
+                sock->setReusePort(true);
+            }
             if (!sock->bind(addr)) {
                 SYLAR_LOG_ERROR(g_logger) << "bind fail errno=" << errno << " errstr=" << strerror(errno) << " addr=["
                                           << addr->toString() << "]";
                 fails.push_back(addr);
                 continue;
             }
-            if (!sock->listen()) {
+            // backlog 直接给内核上限（同时把 net.core.somaxconn 调大才真正生效）：
+            // 默认 SOMAXCONN(4096) 在连接风暴下会溢出，SYN 被丢后客户端只能靠
+            // 指数退避重传，建连速率会断崖式下降
+            if (!sock->listen(65535)) {
                 SYLAR_LOG_ERROR(g_logger) << "listen fail errno=" << errno << " errstr=" << strerror(errno) << " addr=["
                                           << addr->toString() << "]";
                 fails.push_back(addr);
@@ -135,31 +143,30 @@ namespace sylar {
         return true;
     }
 
-    Task TcpServer::handleClient(std::shared_ptr<TcpServer> self, Socket::ptr client)
+    Task TcpServer::handleClient(std::shared_ptr<TcpServer> self, Socket::ptr client,
+                                 sylar::IOManager* iom)
     {
         (void) self; // 仅用于在协程帧中持有服务器，保证服务器存活
+        if (!iom) { iom = m_ioWorker; }   // 未指定则用默认IO实例
         SYLAR_LOG_INFO(g_logger) << "handleClient: " << *client;
 
-        char buffer[4096]; // 缓冲区加大；一次可读事件内循环读取，避免数据被切碎
+        // 接收暂存区放线程局部，不占协程帧空间（每连接省4KB）
+        static thread_local char buffer[4096];
 
         while (!m_isStop) {
-            bool ready = co_await m_ioWorker->waitReadAsync(client->getSocket(), 5000);
-
-            if (!ready || m_isStop) {
-                SYLAR_LOG_INFO(g_logger) << "等待读取超时或服务器停止";
-                break;
-            }
-
             bool peer_closed = false;
             bool recv_error = false;
+            bool got_data = false;
 
-            // 一次可读事件内循环读到 EAGAIN，把内核里已有的数据全部读走
+            // epoll 读事件是常驻注册的：先主动读一次，读到 EAGAIN 才算没有数据。
+            // 这样处理期间到达的数据不会被漏掉，同时避免每次都重新注册 epoll。
             while (true) {
                 ssize_t n = client->recv(buffer, sizeof(buffer));
                 if (n > 0) {
                     // 二进制安全：按字节数记录，用可打印形式输出，不再追加 '\0'
                     SYLAR_LOG_NOTICE(g_logger) << "服务器收到 " << n << " 字节: "
                                                << to_printable(buffer, n);
+                    got_data = true;
                     continue;
                 }
 
@@ -186,8 +193,20 @@ namespace sylar {
                 SYLAR_LOG_ERROR(g_logger) << "recv错误: " << strerror(errno);
                 break;
             }
+            if (got_data) {
+                continue;   // 本轮读到过数据，立刻再检查一次
+            }
+
+            // 确实没有数据可读 → 挂起等可读事件
+            bool ready = co_await iom->waitReadAsync(client->getSocket(), 5000);
+            if (!ready || m_isStop) {
+                SYLAR_LOG_INFO(g_logger) << "等待读取超时或服务器停止";
+                break;
+            }
         }
 
+        // 读事件是常驻注册的：先把fd从epoll摘掉再关闭
+        if (iom) { iom->cancelAll(client->getSocket()); }
         client->close();
         removeClient(client);
         SYLAR_LOG_INFO(g_logger) << "连接已关闭";
@@ -200,23 +219,16 @@ namespace sylar {
         SYLAR_LOG_INFO(g_logger) << "服务器等待连接...";
 
         while (!m_isStop) {
-
-            bool ready = co_await m_acceptWorker->waitReadAsync(sock->getSocket(), 5000);
-
-            // 停止过程中被cancel唤醒时，不要再accept
-            if (!ready || m_isStop) {
-                break;
-            }
-
-            // 一次可读事件内循环accept，把当前排队的连接全部收下，
-            // 避免每个连接都走一次"epoll事件->accept->重新注册"的往返（连接瓶颈）
+            // 监听 fd 的读事件同样是常驻注册：先尝试 accept 排空，
+            // 处理期间到达的连接不会被漏掉；确实没有连接时才挂起等事件。
+            bool got_conn = false;
             while (true) {
                 if (m_isStop) { break; }
 
                 Socket::ptr client = sock->accept();
                 if (!client) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break; // 排队的连接收完了，回去等下一波事件
+                        break; // 排队的连接收完了
                     }
                     SYLAR_LOG_ERROR(g_logger) << "accept errno=" << errno
                                               << " errstr=" << strerror(errno);
@@ -225,7 +237,20 @@ namespace sylar {
 
                 client->setRecvTimeout(m_recvTimeout);
                 addClient(client);
-                m_ioWorker->schedule(handleClient(shared_from_this(), client));
+                // 分发：pickIoWorker 默认返回 m_ioWorker，子类可重写实现负载均衡
+                sylar::IOManager* target = pickIoWorker();
+                if (!target) { target = m_ioWorker; }
+                target->schedule(handleClient(shared_from_this(), client, target));
+                got_conn = true;
+            }
+
+            if (m_isStop) { break; }
+            if (got_conn) { continue; }   // 收到过连接，立刻再试（可能还有新连接）
+
+            // 没有待处理连接 → 挂起等监听 fd 可读
+            bool ready = co_await m_acceptWorker->waitReadAsync(sock->getSocket(), 5000);
+            if (!ready || m_isStop) {
+                break;
             }
         }
         co_return;

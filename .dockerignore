@@ -1,0 +1,7 @@
+.git
+.vscode
+build
+build-tsan
+log.txt
+高性能服务器.txt
+*.out

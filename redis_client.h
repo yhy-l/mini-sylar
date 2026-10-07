@@ -67,6 +67,7 @@ private:
         std::vector<std::string> cmds;                    // 要执行的命令
         std::shared_ptr<std::vector<std::string>> results; // 结果（nullptr=不需要结果）
         std::coroutine_handle<> waiter;                   // 等待的协程（nullptr=无需唤醒）
+        IOManager* ownerIom = nullptr;                    // 等待协程所属的IOManager（多实例时唤醒回原实例）
     };
 
     void submit(QueueTask t);
@@ -105,7 +106,7 @@ public:
             // 标记为等待IO：协程挂起后调度器不会把它放回队列空转
             auto th = std::coroutine_handle<Task::promise_type>::from_address(handle.address());
             th.promise().state = Task::WAITING_IO;
-            client->submit(QueueTask{std::move(cmds), results, handle});
+            client->submit(QueueTask{std::move(cmds), results, handle, IOManager::GetThis()});
         }
 
         const std::vector<std::string>& await_resume() const noexcept { return *results; }

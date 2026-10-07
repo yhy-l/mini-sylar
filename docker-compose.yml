@@ -1,0 +1,77 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"              # AMQP
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"       # Web 管理界面（guest/guest）
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  mini-sylar-1:
+    build: .
+    environment:
+      REDIS_HOST: redis
+      MQ_HOST: rabbitmq
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - rabbitmq
+
+  mini-sylar-2:
+    build: .
+    environment:
+      REDIS_HOST: redis
+      MQ_HOST: rabbitmq
+    ports:
+      - "8082:8080"
+    depends_on:
+      - redis
+      - rabbitmq
+
+  mini-sylar-3:
+    build: .
+    environment:
+      REDIS_HOST: redis
+      MQ_HOST: rabbitmq
+    ports:
+      - "8083:8080"
+    depends_on:
+      - redis
+      - rabbitmq
+
+  log-consumer:
+    build: .
+    command: ["./log_consumer"]
+    restart: unless-stopped
+    environment:
+      MQ_HOST: rabbitmq
+    volumes:
+      - consumer-logs:/app/logs
+    depends_on:
+      - rabbitmq
+      - redis
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./nginx.conf.docker:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - mini-sylar-1
+      - mini-sylar-2
+      - mini-sylar-3
+
+volumes:
+  redis-data:
+  rabbitmq-data:
+  consumer-logs:

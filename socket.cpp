@@ -109,6 +109,15 @@ namespace sylar {
             }
         }
 
+        // 多实例共享端口：fd 创建后、bind 前设置 SO_REUSEPORT
+        if (m_reusePort) {
+            int one = 1;
+            if (setsockopt(m_sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0) {
+                SYLAR_LOG_WARN(g_logger) << "设置 SO_REUSEPORT 失败 errno=" << errno
+                                         << " errstr=" << strerror(errno);
+            }
+        }
+
         if (addr->getFamily() != m_family) {
             SYLAR_LOG_ERROR(g_logger) << "bind sock.family("
                                       << m_family << ") addr.family(" << addr->getFamily()
@@ -232,7 +241,10 @@ namespace sylar {
             return -1;
         }
 
-        ssize_t bytes = ::send(m_sock, buffer, length, flags);
+        // 必须带 MSG_NOSIGNAL：对端异常断开(RST)后继续写会触发 SIGPIPE，
+        // 默认动作是直接杀掉整个进程——一个客户端异常断开就能带走整个服务。
+        // 带上之后 send 返回 -1/EPIPE，由调用方按普通写错误处理。
+        ssize_t bytes = ::send(m_sock, buffer, length, flags | MSG_NOSIGNAL);
         if (bytes < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return 0;  // 非阻塞，暂时无法发送

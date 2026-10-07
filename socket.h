@@ -282,6 +282,12 @@ namespace sylar {
      */
         bool cancelAll();
 
+        /**
+         * 设置是否使用 SO_REUSEPORT（多实例监听同一端口，内核按四元组分发连接）
+         * 注意：需在 bind() 之前调用（fd 在 bind 内部才创建）
+         */
+        void setReusePort(bool v) { m_reusePort = v; }
+
     protected:
         /**
      * 初始化socket
@@ -306,6 +312,7 @@ namespace sylar {
 
     protected:
         int m_sock;           // socket句柄
+        bool m_reusePort = false;   // 是否使用SO_REUSEPORT（多实例共享端口）
         int m_family;         // 地址簇
         int m_type;           // socket类型
         int m_protocol;       // 协议

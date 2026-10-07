@@ -22,7 +22,9 @@ namespace sylar {
         using ptr = std::shared_ptr<IOContext>;
 
         int fd = -1; //文件描述符
-        uint32_t events = 0; //监听的事件类型
+        uint32_t events = 0; //已注册到epoll的事件类型
+        uint32_t waitEvents = 0; //当前等待中的协程真正关心的事件
+        uint32_t pendingEvents = 0; //已到达、但当时没有等待者的事件（防止丢事件）
         std::coroutine_handle<> handle; // 等待此事件的协程句柄
         IOManager* iomanager = nullptr; //所属的IOManager
 
@@ -31,6 +33,8 @@ namespace sylar {
         {
             fd = -1;
             events = 0;
+            waitEvents = 0;
+            pendingEvents = 0;
             handle = nullptr;
             iomanager = nullptr;
         }
@@ -119,7 +123,12 @@ namespace sylar {
             int fd;
             int timeout_ms;
 
-            bool await_ready() const noexcept { return false; }
+            /**
+             * 读事件是常驻注册的，事件有可能在"还没有等待者"的时候就到达了
+             * （比如上一个请求处理期间数据就到了）。这里先消费一次：
+             * 已经就绪就不用挂起，避免白等一个超时周期甚至丢事件。
+             */
+            bool await_ready() { return iom->takePendingEvent(fd, READ); }
 
             void await_suspend(std::coroutine_handle<> handle)
             {
@@ -146,7 +155,7 @@ namespace sylar {
             int fd;
             int timeout_ms;
 
-            bool await_ready() const noexcept { return false; }
+            bool await_ready() { return iom->takePendingEvent(fd, WRITE); }
 
             void await_suspend(std::coroutine_handle<> handle)
             {
@@ -199,6 +208,13 @@ namespace sylar {
         * 返回: 0表示成功
         */
         int waitStop(std::coroutine_handle<> handle);
+
+
+        /**
+         * 消费"已到达但没人等"的事件
+         * 返回true表示事件已经就绪，调用方不需要挂起
+         */
+        bool takePendingEvent(int fd, Event event);
 
 
         /**

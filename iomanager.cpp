@@ -188,7 +188,8 @@ namespace sylar {
 
             auto it = m_fdContexts.find(fd);
             if (it == m_fdContexts.end()) {
-                SYLAR_LOG_ERROR(g_logger) << "未找到fd,取消事件失败";
+                // 连接正常收尾时上下文可能已经没了，属于常见情况，不当作错误
+                SYLAR_LOG_DEBUG(g_logger) << "未找到fd,取消事件失败";
                 return -1;
             }
 
@@ -226,29 +227,49 @@ namespace sylar {
 
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        IOContext::ptr ctx;
         auto it = m_fdContexts.find(fd);
         if (it != m_fdContexts.end()) {
-            ctx = it->second;
-            if (ctx->events & READ) {
-                //事件存在
+            IOContext::ptr ctx = it->second;
+            if (ctx->waitEvents & READ) {
+                // 已经有协程在等这个fd的读事件
                 SYLAR_LOG_ERROR(g_logger) << "waitRead fd=" << fd << " already waiting";
                 return -1;
             }
 
-            ctx->events = (Event) (ctx->events | READ);
+            if (ctx->handle) {
+                SYLAR_LOG_WARN(g_logger) << "fd " << fd << " already has a waiting coroutine, replacing";
+            }
+            ctx->handle = handle;
+            ctx->waitEvents |= READ;
 
-        } else {
-            ctx = std::make_shared<IOContext>();
-            ctx->fd = fd;
-            ctx->events = READ;
-            ctx->iomanager = this;
-            m_fdContexts[fd] = ctx;
+            if (ctx->events & READ) {
+                // 读事件常驻注册：epoll里已经挂着这个fd，直接复用，
+                // 不需要再走一次 epoll_ctl（每请求省一次系统调用）
+                SYLAR_LOG_DEBUG(g_logger) << "复用已注册的读事件 fd=" << fd;
+                return 0;
+            }
+
+            ctx->events |= READ;
+            epoll_event epevent;
+            memset(&epevent, 0, sizeof(epevent));
+            epevent.events = EPOLLET | ctx->events;
+            epevent.data.fd = fd;
+            if (epoll_ctl(m_epfd, EPOLL_CTL_MOD, fd, &epevent) != 0) {
+                SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(MOD) fd=" << fd << " failed";
+                ctx->handle = nullptr;
+                ctx->waitEvents = 0;
+                return -1;
+            }
+            return 0;
         }
 
-        // 保存协程句柄
-        if (ctx->handle) { SYLAR_LOG_WARN(g_logger) << "fd " << fd << " already has a waiting coroutine, replacing"; }
+        IOContext::ptr ctx = std::make_shared<IOContext>();
+        ctx->fd = fd;
+        ctx->events = READ;
+        ctx->waitEvents = READ;
+        ctx->iomanager = this;
         ctx->handle = handle;
+        m_fdContexts[fd] = ctx;
 
         //配置epoll
         epoll_event epevent;
@@ -256,10 +277,9 @@ namespace sylar {
         epevent.events = EPOLLET | ctx->events;
         epevent.data.fd = fd;
 
-        int op = it != m_fdContexts.end() ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-        if (epoll_ctl(m_epfd, op, fd, &epevent) != 0) {
-            SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(" << op << ") fd=" << fd << " failed";
-            if (it == m_fdContexts.end()) { m_fdContexts.erase(fd); }
+        if (epoll_ctl(m_epfd, EPOLL_CTL_ADD, fd, &epevent) != 0) {
+            SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(ADD) fd=" << fd << " failed";
+            m_fdContexts.erase(fd);
             ctx->handle = nullptr;
             return -1;
         }
@@ -273,28 +293,46 @@ namespace sylar {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        IOContext::ptr ctx;
         auto it = m_fdContexts.find(fd);
         if (it != m_fdContexts.end()) {
-            ctx = it->second;
-            if (ctx->events & WRITE) {
+            IOContext::ptr ctx = it->second;
+            if (ctx->waitEvents & WRITE) {
                 SYLAR_LOG_ERROR(g_logger) << "waitWrite fd=" << fd << " already waiting";
                 return -1;
             }
-            ctx->events = (Event)(ctx->events | WRITE);
-        } else {
-            ctx = std::make_shared<IOContext>();
-            ctx->fd = fd;
-            ctx->events = WRITE;
-            ctx->iomanager = this;
-            m_fdContexts[fd] = ctx;
+
+            if (ctx->handle) {
+                SYLAR_LOG_WARN(g_logger) << "fd " << fd << " already has a waiting coroutine, replacing";
+            }
+            ctx->handle = handle;
+            ctx->waitEvents |= WRITE;
+
+            if (ctx->events & WRITE) {
+                // 写关注已经注册过了，直接复用
+                return 0;
+            }
+
+            ctx->events |= WRITE;
+            epoll_event epevent;
+            memset(&epevent, 0, sizeof(epevent));
+            epevent.events = EPOLLET | ctx->events;
+            epevent.data.fd = fd;
+            if (epoll_ctl(m_epfd, EPOLL_CTL_MOD, fd, &epevent) != 0) {
+                SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(MOD) fd=" << fd << " failed";
+                ctx->handle = nullptr;
+                ctx->waitEvents = 0;
+                return -1;
+            }
+            return 0;
         }
 
-        // 保存协程句柄
-        if (ctx->handle) {
-            SYLAR_LOG_WARN(g_logger) << "fd " << fd << " already has a waiting coroutine, replacing";
-        }
+        IOContext::ptr ctx = std::make_shared<IOContext>();
+        ctx->fd = fd;
+        ctx->events = WRITE;
+        ctx->waitEvents = WRITE;
+        ctx->iomanager = this;
         ctx->handle = handle;
+        m_fdContexts[fd] = ctx;
 
         // 配置epoll事件
         epoll_event epevent;
@@ -302,12 +340,9 @@ namespace sylar {
         epevent.events = EPOLLET | ctx->events;
         epevent.data.fd = fd;
 
-        int op = it != m_fdContexts.end() ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-        if (epoll_ctl(m_epfd, op, fd, &epevent) != 0) {
-            SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(" << op << ") fd=" << fd << " failed";
-            if (it == m_fdContexts.end()) {
-                m_fdContexts.erase(fd);
-            }
+        if (epoll_ctl(m_epfd, EPOLL_CTL_ADD, fd, &epevent) != 0) {
+            SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(ADD) fd=" << fd << " failed";
+            m_fdContexts.erase(fd);
             ctx->handle = nullptr;
             return -1;
         }
@@ -375,6 +410,23 @@ namespace sylar {
         return m_pendingEventCount > 0;
     }
 
+    bool IOManager::takePendingEvent(int fd, Event event)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        auto it = m_fdContexts.find(fd);
+        if (it == m_fdContexts.end()) {
+            return false;
+        }
+
+        if (!(it->second->pendingEvents & event)) {
+            return false;
+        }
+
+        it->second->pendingEvents &= ~event;
+        return true;
+    }
+
     void IOManager::idle()
     {
         static sylar::Logger::ptr g_logger = SYLAR_LOG_NAME("system");
@@ -439,9 +491,9 @@ namespace sylar {
                 }
                 IOContext* ctx = it->second.get();
 
-                // 确定触发的事件类型
-                int happened_events = NONE;
-                if (event.events & EPOLLIN) {
+                // 确定触发的事件类型：对端关闭/挂起也算"可读"，让协程去recv拿到EOF
+                uint32_t happened_events = 0;
+                if (event.events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) {
                     happened_events |= READ;
                     SYLAR_LOG_DEBUG(g_logger) << "IO事件: fd=" << ctx->fd << " 可读";
                 }
@@ -449,42 +501,60 @@ namespace sylar {
                     happened_events |= WRITE;
                     SYLAR_LOG_DEBUG(g_logger) << "IO事件: fd=" << ctx->fd << " 可写";
                 }
+                if (event.events & EPOLLERR) {
+                    happened_events |= (READ | WRITE);
+                }
 
-                // 取出等待中的协程句柄（仅当协程真正挂起时；运行中/队列中=过期事件，不取）
-                if (ctx->handle) {
+                bool need_rearm = false;
+
+                // 只有等待者确实在等这个事件时才唤醒它
+                if (ctx->handle && (happened_events & ctx->waitEvents)) {
                     auto th = std::coroutine_handle<Task::promise_type>::from_address(ctx->handle.address());
                     // resuming=true表示协程正在被某个线程resume（含await_suspend阶段），
                     // 此时取句柄会导致第二个线程并发resume同一帧。必须等resume完全返回。
                     if (th.promise().state == Task::WAITING_IO && !th.promise().resuming) {
                         handle = ctx->handle;
                         ctx->handle = nullptr;
+                        ctx->waitEvents = 0;
                     } else {
                         // 过期/在途事件：协程已被调度或正在运行，不能重复取句柄。
                         // 直接跳过整个事件、不动上下文（协程正在用它的注册状态）。
                         SYLAR_LOG_DEBUG(g_logger) << "跳过在途事件 fd=" << ctx->fd;
                         continue;
                     }
+                } else if (happened_events) {
+                    // 事件到了但没有等待者（或等待者等的不是这个事件，比如在等写却来了读）：
+                    // 记下来，等它下次挂起时由 await_ready 直接返回就绪，避免丢事件
+                    ctx->pendingEvents |= happened_events;
                 }
 
-                // 清除已触发的事件
-                ctx->events = (Event)(ctx->events & ~happened_events);
+                // 写事件是一次性关注：触发后取消注册，由等待者需要时重新注册
+                if ((ctx->events & WRITE) && (happened_events & WRITE)) {
+                    ctx->events &= ~WRITE;
+                    need_rearm = true;
+                }
+                // 读事件是常驻注册：触发后保留在epoll里，下次 waitRead 直接复用，
+                // 省掉每请求一次 epoll_ctl(ADD/DEL)；连接结束时由 cancelAll 统一摘除。
 
-                // 如果还有剩余事件，重新设置epoll
-                if (ctx->events != NONE) {
-                    epoll_event epevent;
-                    memset(&epevent, 0, sizeof(epevent));
-                    epevent.events = EPOLLET | ctx->events;
-                    epevent.data.fd = ctx->fd;
+                if (need_rearm) {
+                    if (ctx->events != NONE) {
+                        epoll_event epevent;
+                        memset(&epevent, 0, sizeof(epevent));
+                        epevent.events = EPOLLET | ctx->events;
+                        epevent.data.fd = ctx->fd;
 
-                    if (epoll_ctl(m_epfd, EPOLL_CTL_MOD, ctx->fd, &epevent) != 0) {
-                        SYLAR_LOG_ERROR(g_logger) << "epoll_ctl修改失败 fd=" << ctx->fd;
+                        if (epoll_ctl(m_epfd, EPOLL_CTL_MOD, ctx->fd, &epevent) != 0) {
+                            SYLAR_LOG_ERROR(g_logger) << "epoll_ctl修改失败 fd=" << ctx->fd;
+                        }
+                    } else {
+                        // 没有任何关注事件了：从epoll删除并清理map
+                        int efd = ctx->fd;
+                        if (epoll_ctl(m_epfd, EPOLL_CTL_DEL, efd, nullptr) != 0) {
+                            SYLAR_LOG_ERROR(g_logger) << "epoll_ctl删除失败 fd=" << efd;
+                        }
+                        m_fdContexts.erase(it);
+                        --m_pendingEventCount;
                     }
-                } else {
-                    // 没有剩余事件，从epoll中删除并清理map
-                    if (epoll_ctl(m_epfd, EPOLL_CTL_DEL, ctx->fd, nullptr) != 0) {
-                        SYLAR_LOG_ERROR(g_logger) << "epoll_ctl删除失败 fd=" << ctx->fd;
-                    }
-                    m_fdContexts.erase(it);
                 }
             }
 
@@ -494,6 +564,7 @@ namespace sylar {
 
                 auto task_handle = std::coroutine_handle<Task::promise_type>::from_address(handle.address());
                 task_handle.promise().state = Task::READY;
+
                 schedule(Task(handle));
             }
         }

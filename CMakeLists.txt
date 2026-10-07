@@ -7,6 +7,23 @@ set(CMAKE_CXX_MODULE_STD ON)
 
 project(mini-sylar LANGUAGES CXX)
 
+# 不指定 CMAKE_BUILD_TYPE 时，CMake 不会加任何优化选项（等价 -O0），
+# 压测时会被"没优化"的开销（大量内联函数变成真实调用）淹没，
+# 对比数据完全失真。这里显式给一个默认的 Release(-O3 -DNDEBUG)。
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    message(STATUS "未指定 CMAKE_BUILD_TYPE，默认使用 Release (-O3 -DNDEBUG)")
+endif()
+
+# Release 下开启链接时优化：HTTP层/调度器/IO层之间的大量小函数
+# 能跨编译单元内联，压测时有可观的收益
+# （cmake_minimum_required 3.8 对应的 CMP0069 是 OLD，
+#   INTERPROCEDURAL_OPTIMIZATION 属性会被忽略，所以这里直接加 -flto）
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
+endif()
+
 add_executable(mini-sylar
     main.cpp
     log.h log.cpp
